@@ -376,6 +376,54 @@ func TestCreateTorrent_TargetPieceCount(t *testing.T) {
 	}
 }
 
+func TestGetAutomaticPieceLengthExp(t *testing.T) {
+	tests := []struct {
+		name       string
+		trackerURL string
+		size       uint64
+		want       uint
+	}{
+		{
+			name: "default automatic sizing",
+			size: 63 << 20,
+			want: 15,
+		},
+		{
+			name:       "tracker-specific automatic sizing",
+			trackerURL: "https://gazellegames.net/announce?passkey=123",
+			size:       3 << 30,
+			want:       21,
+		},
+		{
+			name:       "unknown tracker falls back to default automatic sizing",
+			trackerURL: "https://unknown.tracker/announce",
+			size:       63 << 20,
+			want:       15,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := GetAutomaticPieceLengthExp(AutomaticPieceLengthOptions{
+				TrackerURL:  tt.trackerURL,
+				ContentSize: tt.size,
+			})
+			if err != nil {
+				t.Fatalf("GetAutomaticPieceLengthExp() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("GetAutomaticPieceLengthExp() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetAutomaticPieceLengthExpRejectsOverflow(t *testing.T) {
+	if _, err := GetAutomaticPieceLengthExp(AutomaticPieceLengthOptions{ContentSize: uint64(1) << 63}); err == nil {
+		t.Fatal("expected overflow error")
+	}
+}
+
 func TestGetRecommendedPieceLengthExpMatchesCreateMinimum(t *testing.T) {
 	got := GetRecommendedPieceLengthExp("https://beyond-hd.me/announce?passkey=123", 32<<20)
 	if got != 16 {
@@ -457,6 +505,48 @@ func TestCreateTorrent_ExplicitPieceLengthBounds(t *testing.T) {
 			info, err := tor.UnmarshalInfo()
 			require.NoError(t, err)
 			assert.Equal(t, int64(1)<<tt.exp, info.PieceLength)
+		})
+	}
+}
+
+func TestCreateTorrent_MaxPieceLengthBounds(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "small.bin")
+	require.NoError(t, os.WriteFile(filePath, make([]byte, 1<<20), 0o644))
+
+	tests := []struct {
+		name        string
+		trackerURL  string
+		maxExp      uint
+		targetCount *uint
+		wantErr     bool
+	}{
+		{name: "automatic default-range tracker rejects 16 KiB maximum", trackerURL: "https://beyond-hd.me/announce?passkey=123", maxExp: 14, wantErr: true},
+		{name: "automatic without tracker rejects 16 KiB maximum", maxExp: 14, wantErr: true},
+		{name: "automatic custom-range tracker accepts 16 KiB maximum", trackerURL: "https://portugas.org/announce/passkey", maxExp: 14},
+		{name: "target-piece-count default-range tracker rejects 16 KiB maximum", trackerURL: "https://beyond-hd.me/announce?passkey=123", maxExp: 14, targetCount: new(uint(2048)), wantErr: true},
+		{name: "target-piece-count custom-range tracker still rejects below historical 64 KiB floor", trackerURL: "https://portugas.org/announce/passkey", maxExp: 14, targetCount: new(uint(2048)), wantErr: true},
+		{name: "target-piece-count custom-range tracker accepts 64 KiB maximum", trackerURL: "https://portugas.org/announce/passkey", maxExp: 16, targetCount: new(uint(2048))},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var trackerURLs []string
+			if tt.trackerURL != "" {
+				trackerURLs = []string{tt.trackerURL}
+			}
+			tor, err := CreateTorrent(CreateOptions{
+				Path: filePath, TrackerURLs: trackerURLs, MaxPieceLength: new(tt.maxExp),
+				TargetPieceCount: tt.targetCount, IsPrivate: true, NoDate: true, NoCreator: true, Version: "test",
+			})
+			if tt.wantErr {
+				assert.ErrorContains(t, err, "max piece length exponent must be between")
+				return
+			}
+			require.NoError(t, err)
+			info, err := tor.UnmarshalInfo()
+			require.NoError(t, err)
+			assert.LessOrEqual(t, info.PieceLength, int64(1)<<tt.maxExp)
 		})
 	}
 }
